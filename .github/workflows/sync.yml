@@ -4,7 +4,7 @@ on:
   schedule:
     # Every 3 hours. Also keeps the repo "active" so GitHub does not disable
     # scheduled workflows on public repos after 60 days of quiet.
-    - cron: "17 */3 * * *"
+    - cron: "23 */3 * * *"
   workflow_dispatch:
 
 # The manifest is committed back after each run, so runs must not overlap.
