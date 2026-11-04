@@ -1,0 +1,15 @@
+# credentials, by pattern
+*token*
+*secret*
+*salt*
+*refresh*
+*.pem
+*.key
+.env
+.env.*
+
+# working files
+_tmp_*
+state.json.tmp
+__pycache__/
+*.pyc
