@@ -191,6 +191,10 @@ def twitch_token():
     return r.json()["access_token"]
 
 
+class SourceMissing(Exception):
+    """A source's channel cannot be found. Not fatal: the other source still runs."""
+
+
 def twitch_vods(token):
     h = {"Client-ID": TWITCH_ID, "Authorization": f"Bearer {token}"}
     u = requests.get("https://api.twitch.tv/helix/users",
@@ -198,7 +202,7 @@ def twitch_vods(token):
     u.raise_for_status()
     users = u.json().get("data", [])
     if not users:
-        sys.exit("channel not found")
+        raise SourceMissing("channel not found")
     uid = users[0]["id"]
     private(uid, TWITCH_CHANNEL, users[0].get("display_name"))
 
@@ -218,6 +222,89 @@ def twitch_vods(token):
         cursor = body.get("pagination", {}).get("cursor")
         if not cursor:
             return out
+
+
+# ------------------------------------------------------------- SECOND SOURCE (K)
+# The channel now also streams on a second platform ("K"). Its finished VODs are archived exactly like the first
+# source's: same playlist, same "[date] title" format, PRIVATE, same slicing, same hashed state. That platform keeps
+# an unverified channel's VODs only 7 days. The channel comes ONLY from secrets: SOURCE_K (its slug) and
+# SOURCE_K_ID (the numeric channel id the slug must resolve to, or nothing is read). Downloaded from the VOD's own
+# 1080p HLS media playlist through the slice path below. Its id is "k:<stream start, unix s>". Every value is masked.
+SOURCE_K = os.environ.get("SOURCE_K", "").strip()
+SOURCE_K_ID = os.environ.get("SOURCE_K_ID", "").strip()
+K_API = "https://" + "kick.com"
+private(SOURCE_K, SOURCE_K_ID)
+K_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/130.0 Safari/537.36", "Accept": "application/json"}
+
+
+def _k_get(url, as_json=True):
+    for k in range(4):
+        try:
+            r = requests.get(url, headers=K_UA, timeout=30)
+            r.raise_for_status()
+            return r.json() if as_json else r.text
+        except Exception:   # noqa: BLE001 - gentle retries, then raise
+            if k == 3:
+                raise
+            time.sleep(3 * (k + 1))
+
+
+def _hms(seconds):
+    s = int(seconds)
+    return f"{s // 3600}h{s % 3600 // 60}m{s % 60}s"
+
+
+def k_rendition(master_url):
+    """(url, bytes/s) of the 1920x1080 rendition with the highest frame rate in the master playlist."""
+    text = _k_get(master_url, as_json=False)
+    base = master_url.split("?", 1)[0].rsplit("/", 1)[0] + "/"
+    lines, best = text.splitlines(), None
+    for i, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+        attrs = dict(kv.split("=", 1) for kv in line.split(":", 1)[1].split(",") if "=" in kv)
+        if attrs.get("RESOLUTION") != "1920x1080":
+            continue
+        uri = next((x.strip() for x in lines[i + 1:] if x.strip() and not x.startswith("#")), "")
+        cand = (float(attrs.get("FRAME-RATE", "0") or 0), uri if uri.startswith("http") else base + uri,
+                int(attrs.get("BANDWIDTH", "0") or 0))
+        best = max(best, cand) if best else cand
+    if not best:
+        raise RuntimeError("no 1920x1080 rendition in the master playlist (source quality only)")
+    private(best[1])
+    return best[1], (best[2] / 8) if best[2] else FALLBACK_BYTES_PER_SEC
+
+
+def k_vods():
+    """Finished VODs of the second source, shaped like Twitch's (id, created_at, duration, title, url, ...)."""
+    if not SOURCE_K:
+        return []
+    ch = _k_get(f"{K_API}/api/v2/channels/{SOURCE_K}")
+    if not SOURCE_K_ID or str(ch.get("id")) != SOURCE_K_ID:
+        raise SourceMissing("the SOURCE_K slug does not resolve to SOURCE_K_ID: nothing read")
+    out = []
+    for v in _k_get(f"{K_API}/api/v2/channels/{SOURCE_K}/videos") or []:
+        if str(v.get("channel_id")) != SOURCE_K_ID:
+            raise SourceMissing("the video list has another channel's VOD in it: nothing read")
+        start = str(v.get("start_time") or v.get("created_at") or "").strip().replace(" ", "T")
+        if not start:
+            continue
+        start_dt = datetime.fromisoformat(start.split(".")[0].rstrip("Z") + "+00:00")
+        dur = float(v.get("duration") or 0) / 1000.0           # ms; 0 while live
+        uuid = (v.get("video") or {}).get("uuid") or ""
+        vod = {
+            "id": f"k:{int(start_dt.timestamp())}", "platform": "k",
+            "created_at": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), "duration": _hms(dur),
+            "title": v.get("session_title") or "Stream",
+            "game_name": ((v.get("categories") or [{}])[0] or {}).get("name", ""),
+            "url": f"{K_API}/{SOURCE_K}/videos/{uuid}" if uuid else f"{K_API}/{SOURCE_K}",
+            "status": "recording" if v.get("is_live") or not dur else "recorded",
+            "master": v.get("source") or "",
+        }
+        private(vod["id"], vod["title"], vod["game_name"], vod["url"], vod["master"], uuid, v.get("id"))
+        out.append(vod)
+    return out
 
 
 def parse_duration(s):
@@ -319,6 +406,13 @@ def wipe_temp():
 def probe_rate(vod):
     """Bytes per second of the best rendition, from yt-dlp's metadata (one
     request, nothing downloaded). Falls back to a pessimistic constant."""
+    if vod.get("platform") == "k":
+        try:
+            vod["playlist"], rate = k_rendition(vod["master"])
+            return rate * 1.05 + 350 * 1000 / 8
+        except Exception as exc:  # noqa: BLE001
+            log(f"  rendition probe failed ({exc}); assuming {FALLBACK_BYTES_PER_SEC / 1e6:.1f} MB/s")
+            return FALLBACK_BYTES_PER_SEC
     try:
         res = subprocess.run(
             ["yt-dlp", "-J", "--no-warnings", "--skip-download", vod["url"]],
@@ -368,6 +462,10 @@ def plan_slices(duration_s, rate, free):
 
 def media_playlist_url(vod):
     """The media playlist of the rendition `-f best` downloads (one request, nothing downloaded)."""
+    if vod.get("platform") == "k":
+        if not vod.get("playlist"):
+            vod["playlist"], _ = k_rendition(vod["master"])
+        return vod["playlist"]
     res = subprocess.run(["yt-dlp", "-f", "best", "-g", "--no-warnings", vod["url"]],
                          capture_output=True, text=True, timeout=120)
     urls = [u for u in res.stdout.split() if u.startswith("http")]
@@ -454,6 +552,9 @@ def download_slice(vod, path, start, end, timeout):
 def download(vod, path, start=None, end=None, expect_bytes=None):
     """True (whole VOD) or the slice's expected seconds when it worked; False when not."""
     timeout = int(est_seconds(expect_bytes)) if expect_bytes else None
+    if start is None and vod.get("platform") == "k":
+        # second source: always through the segment playlist (the whole VOD = one slice covering everything)
+        start, end = 0, parse_duration(vod["duration"]) + 60
     if start is not None:
         return download_slice(vod, path, start, end, timeout)
     cmd = ["yt-dlp", "-f", "best", "--no-progress", "--no-warnings",
@@ -542,17 +643,60 @@ def _clean(text):
     return text.replace("<", "\u2039").replace(">", "\u203a")
 
 
+def archive_title(vod, part=None, parts=None):
+    label = f" (Part {part}/{parts})" if part and parts and parts > 1 else ""
+    return _clean(f"[{vod['created_at'][:10]}] {vod['title']}")[:100 - len(label)] + label
+
+
+def channel_guard(yt):
+    """Uploads go ONLY to the channel named by the EXPECTED_CHANNEL secret (19 Nov: a second-source VOD was once
+    archived by another person's lane onto their channel). No secret, or a different channel = stop, nothing uploads."""
+    want = os.environ.get("EXPECTED_CHANNEL", "").strip()
+    private(want)
+    items = yt.channels().list(part="id,contentDetails", mine=True).execute().get("items", [])
+    got = items[0]["id"] if items else ""
+    private(got)
+    if not want or got != want:
+        sys.exit("channel guard: the YouTube token is not the expected channel (or EXPECTED_CHANNEL is unset); "
+                 "nothing uploaded")
+    log("channel guard: the token is the expected channel")
+    return items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+
+
+def already_on_channel(yt, uploads_id, playlist_id, title):
+    """Ask YouTube first: the id of a video on this channel with exactly this title (newest 100 uploads + the archive
+    playlist), else None. Raises if YouTube cannot be read, so the caller uploads nothing rather than guessing."""
+    for pl, pages in ((uploads_id, 2), (playlist_id, 20)):
+        if not pl:
+            continue
+        token = None
+        for _ in range(pages):
+            r = yt.playlistItems().list(part="snippet", playlistId=pl, maxResults=50,
+                                        **({"pageToken": token} if token else {})).execute()
+            for it in r.get("items", []):
+                sn = it.get("snippet") or {}
+                if sn.get("title") == title:
+                    vid = (sn.get("resourceId") or {}).get("videoId")
+                    private(vid)
+                    return vid
+            token = r.get("nextPageToken")
+            if not token:
+                break
+    return None
+
+
 def upload(yt, vod, path, part=None, parts=None):
     label = f" (Part {part}/{parts})" if part and parts and parts > 1 else ""
+    src = "Kick" if vod.get("platform") == "k" else "Twitch"
     body = {
         "snippet": {
-            "title": _clean(f"[{vod['created_at'][:10]}] {vod['title']}")[:100 - len(label)] + label,
+            "title": archive_title(vod, part, parts),
             "description": _clean(
-                f"Twitch VOD archive.\n\n"
+                f"{src} VOD archive.\n\n"
                 f"Streamed: {vod['created_at']}\n"
                 f"Duration: {vod['duration']}\n"
                 f"Original: {vod['url']}\n"
-                f"Twitch id: {vod['id']}\n"
+                f"{src} id: {vod['id']}\n"
                 + (f"Part {part} of {parts} (too long for one file on the archive runner)\n" if label else "")
             )[:5000],
             # 20 = Gaming. Avoids YouTube guessing.
@@ -638,7 +782,19 @@ def main():
     done = load_manifest()
     done_ids = completed_ids(done)
 
-    vods = twitch_vods(twitch_token())
+    # Each source is optional: one that cannot be read is skipped quietly and never stops the other.
+    vods = []
+    try:
+        vods += twitch_vods(twitch_token())
+    except Exception as exc:  # noqa: BLE001
+        log(f"source T skipped this run ({type(exc).__name__})")
+    try:
+        kv = k_vods()
+        if kv:
+            log(f"source K: {len(kv)} VOD(s) listed")
+        vods += kv
+    except Exception as exc:  # noqa: BLE001
+        log(f"source K skipped this run ({type(exc).__name__}: {str(exc)[:160]})")
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=MIN_AGE_MINUTES)
 
     pending = []
@@ -666,14 +822,16 @@ def main():
         pending.append(v)
 
     pending.sort(key=lambda v: v["created_at"])  # oldest first: they expire first
-    log(f"{len(vods)} VODs on Twitch, {len(done_ids)} already archived, {len(pending)} to do")
+    log(f"{len(vods)} VODs listed, {len(done_ids)} already archived, {len(pending)} to do")
 
     if not pending:
         log("nothing to archive")
         return
 
     yt = youtube()
+    uploads_id = channel_guard(yt)
     playlist_id = get_or_create_playlist(yt)
+    dry = os.environ.get("DRY") == "1"
     used = 0
     uploaded_units = 0   # parts (or whole VODs) uploaded this run
     out_of_time = False
@@ -750,9 +908,25 @@ def main():
                     log(f"  slice {idx}/{len(parts)} no longer fits ({free_bytes() / 1e9:.1f} GB free); next run")
                     break
 
-                path = os.path.join(HERE, f"_tmp_{v['id']}.mp4")
+                path = os.path.join(HERE, f"_tmp_{hid(v['id'])}.mp4")
                 if multi:
                     log(f"  -- part {idx}/{len(parts)}  {a / 3600:.2f}h -> {b / 3600:.2f}h")
+                # ask YouTube first: a part already on the channel is recorded, never uploaded twice
+                have_vid = already_on_channel(yt, uploads_id, playlist_id,
+                                              archive_title(v, idx if multi else None, len(parts) if multi else None))
+                if have_vid:
+                    log("  already on the channel; recorded, not uploaded again")
+                    entry = {"id": hid(v["id"]), "day": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "found": True}
+                    if multi:
+                        entry.update({"part": idx, "parts": len(parts), "chunk_s": chunk_s})
+                    if not dry:
+                        done.append(entry)
+                        save_manifest(done)
+                        checkpoint_manifest()
+                    continue
+                if dry:
+                    log(f"  DRY: would download + upload this piece (~{need / 1e9:.1f} GB); nothing done")
+                    continue
                 ok = False
                 for attempt in (1, 2):
                     got = download(v, path, a, b, expect_bytes=need)
@@ -815,6 +989,12 @@ def main():
     log(f"\nuploaded {uploaded_units} file(s) this run, {remaining} VOD(s) still outstanding")
 
     step_out = os.environ.get("GITHUB_OUTPUT")
+    if dry:   # a DRY run never re-triggers itself and never fails for "nothing moved"
+        if step_out:
+            with open(step_out, "a", encoding="utf-8") as fh:
+                fh.write("archived=0\nremaining=0\ncontinue=no\n")
+        log("DRY run done: nothing downloaded, uploaded or recorded")
+        return
     if step_out:
         with open(step_out, "a", encoding="utf-8") as fh:
             fh.write(f"archived={uploaded_units}\n")

@@ -6,6 +6,11 @@ on:
     # scheduled workflows on public repos after 60 days of quiet.
     - cron: "23 */3 * * *"
   workflow_dispatch:
+    inputs:
+      dry:
+        description: "DRY: list, check the channel and plan the pieces; download/upload/record nothing"
+        type: boolean
+        default: false
 
 # The manifest is committed back after each run, so runs must not overlap.
 concurrency:
@@ -77,6 +82,10 @@ jobs:
           NOTIFY_WORKER_URL: ${{ secrets.NOTIFY_WORKER_URL }}
           NOTIFY_WEBHOOK_TOKEN: ${{ secrets.NOTIFY_WEBHOOK_TOKEN }}
           ARCHIVE_LANE: ${{ secrets.ARCHIVE_LANE }}
+          SOURCE_K: ${{ secrets.SOURCE_K }}
+          SOURCE_K_ID: ${{ secrets.SOURCE_K_ID }}
+          EXPECTED_CHANNEL: ${{ secrets.EXPECTED_CHANNEL }}
+          DRY: ${{ inputs.dry && '1' || '0' }}
         run: python sync.py
 
       - name: Commit state
